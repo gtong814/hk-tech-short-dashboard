@@ -47,24 +47,16 @@ HEADERS = {
 # ==========================================
 @st.cache_data(ttl=3600)
 def fetch_sfc_weekly_short_positions(num_weeks=6):
-    """
-    直接按日期推算 SFC 官方 CSV 網址 (避開網頁 HTML 爬蟲攔截)。
-    格式: https://www.sfc.hk/-/media/EN/pdf/spr/YYYY/MM/DD/Short_Position_Reporting_Aggregated_Data_YYYYMMDD.csv
-    """
     dfs = []
     today = datetime.now()
-    # 找出最近一個星期五
     days_since_friday = (today.weekday() - 4) % 7
     last_friday = today - timedelta(days=days_since_friday)
 
-    checked_weeks = 0
     week_offset = 0
-
     while len(dfs) < num_weeks and week_offset < num_weeks + 6:
         target_fri = last_friday - timedelta(weeks=week_offset)
         week_offset += 1
 
-        # 嘗試星期五，若遇香港公眾假期則順延檢查星期四、星期三
         for day_shift in [0, 1, 2]:
             d = target_fri - timedelta(days=day_shift)
             url = (
@@ -132,7 +124,7 @@ def fetch_aastocks_short(aa_symbol):
         return pd.DataFrame(), str(e)[:60]
 
 # ==========================================
-# 3. 批量掃描核心邏輯 (支援降級運作，永不崩潰)
+# 3. 批量掃描核心邏輯 (支援降級運作)
 # ==========================================
 @st.cache_data(ttl=1800)
 def run_full_scan(watchlist, sfc_df, sfc_dates):
@@ -160,7 +152,6 @@ def run_full_scan(watchlist, sfc_df, sfc_dates):
                 continue
             price_df.index = pd.to_datetime(price_df.index).tz_localize(None)
 
-            # 嘗試抓取每日沽空，若失敗仍保留股價數據
             short_df, aa_msg = fetch_aastocks_short(aa_symbol)
             if aa_msg != "OK":
                 aa_status_log.append(f"{yf_ticker}: {aa_msg}")
@@ -171,7 +162,6 @@ def run_full_scan(watchlist, sfc_df, sfc_dates):
                 df = price_df.copy()
                 df["Short_Ratio"] = np.nan
 
-            # 計算技術與沽空指標
             df["Vol_MA20"] = df["Volume"].rolling(20, min_periods=5).mean()
             df["Vol_Ratio"] = df["Volume"] / df["Vol_MA20"]
             df["SR_MA10"] = df["Short_Ratio"].rolling(10, min_periods=3).mean()
@@ -183,8 +173,8 @@ def run_full_scan(watchlist, sfc_df, sfc_dates):
             latest = df.iloc[-1]
             sr = latest["Short_Ratio"]
             sr_z = latest["SR_ZScore"] if pd.notna(latest["SR_ZScore"]) else 0.0
-            vol_r = float(latest["Vol_Ratio"])
-            chg_5d = float(latest["Price_Chg_5D"])
+            vol_r = float(latest["Vol_Ratio"]) if pd.notna(latest["Vol_Ratio"]) else 1.0
+            chg_5d = float(latest["Price_Chg_5D"]) if pd.notna(latest["Price_Chg_5D"]) else 0.0
             rs_vs_bm = chg_5d - bm_5d_chg
             is_green = latest["Close"] >= latest["Open"]
 
@@ -233,10 +223,10 @@ def run_full_scan(watchlist, sfc_df, sfc_dates):
                 "5日漲跌(%)": round(chg_5d, 2),
                 "相對3033(%)": round(rs_vs_bm, 2),
                 "量比": round(vol_r, 2),
-                "日沽空(%)": round(float(sr), 2) if pd.notna(sr) else None,
+                "日沽空(%)": round(float(sr), 2) if pd.notna(sr) else np.nan,
                 "沽空Z-Score": round(float(sr_z), 2) if pd.notna(sr) else 0.0,
-                "SFC淡倉(百萬HKD)": round(float(sfc_hkd_m), 1) if pd.notna(sfc_hkd_m) else None,
-                "SFC淡倉周變動(%)": round(float(sfc_wow_pct), 2) if pd.notna(sfc_wow_pct) else None,
+                "SFC淡倉(百萬HKD)": round(float(sfc_hkd_m), 1) if pd.notna(sfc_hkd_m) else np.nan,
+                "SFC淡倉周變動(%)": round(float(sfc_wow_pct), 2) if pd.notna(sfc_wow_pct) else np.nan,
                 "雙重確認訊號": signal
             })
             time.sleep(0.3)
@@ -293,7 +283,7 @@ c1.metric("大市濾網 (3033.HK)", f"{bm_info['close']:.2f} HKD", f"{bm_info['c
 c2.metric("3033.HK 趨勢狀態", regime_str, f"MA20: {bm_info['ma20']:.2f}")
 latest_sfc_str = pd.to_datetime(sfc_dates[0]).strftime("%Y-%m-%d") if sfc_dates else "暫無數據"
 c3.metric("SFC 最新淡倉報告日", latest_sfc_str, f"已載入 {len(sfc_dates)} 周數據")
-squeeze_cnt = scan_df["雙重確認訊號"].str.contains("逼空|強勢").sum() if not scan_df.empty else 0
+squeeze_cnt = int(scan_df["雙重確認訊號"].str.contains("逼空|強勢").sum()) if not scan_df.empty else 0
 c4.metric("今日強勢/逼空訊號數", f"{squeeze_cnt} 隻")
 
 # 分頁設計
@@ -310,8 +300,12 @@ with tab1:
             if has_short_ratio
             else "香港科技股 vs 3033.HK：相對強弱 (RS%) 與量比四象限 (日沽空降級模式)"
         )
+
+        # 強制轉換為 float 數值型態，避免 Plotly 報錯
         plot_df = scan_df.copy()
-        plot_df["點大小"] = plot_df["日沽空(%)"].fillna(20)
+        plot_df[x_col] = pd.to_numeric(plot_df[x_col], errors="coerce").fillna(0.0).astype(float)
+        plot_df["量比"] = pd.to_numeric(plot_df["量比"], errors="coerce").fillna(1.0).astype(float)
+        plot_df["點大小"] = pd.to_numeric(plot_df["日沽空(%)"], errors="coerce").fillna(20.0).clip(lower=5.0).astype(float)
 
         fig_quad = px.scatter(
             plot_df,
